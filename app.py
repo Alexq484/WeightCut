@@ -146,7 +146,7 @@ def get_food_macros(fdc_id):
     return macros
 
 
-def calculate_macros(weight, target_calories, fat_percentage=0.25, carb_percentage=None):
+def calculate_macros(weight, target_calories, fat_percentage=0.25, carb_percentage=None, lean_body_mass=None):
     """
     Calculate macro breakdown based on weight and target calories.
     
@@ -155,11 +155,16 @@ def calculate_macros(weight, target_calories, fat_percentage=0.25, carb_percenta
         target_calories: Total daily calorie target
         fat_percentage: Percentage of total calories from fat (default 0.25 = 25%)
         carb_percentage: Percentage of total calories from carbs (optional, if None carbs fill remaining)
+        lean_body_mass: Lean body mass in pounds (optional, used for protein calculation at 1.2g per lb)
     
     Returns:
         Dictionary with macro breakdown in grams and calories
     """
-    protein_grams = weight 
+    # Use 1.2 * lean body mass for protein if available, otherwise use total weight
+    if lean_body_mass:
+        protein_grams = lean_body_mass * 1.2
+    else:
+        protein_grams = weight
     protein_calories = protein_grams * 4
     
     fat_calories = target_calories * fat_percentage
@@ -209,6 +214,107 @@ def calculate_micros(days_to_goal):
         'fiber_grams': fiber_grams,
         'sodium_mg': sodium_mg
     }
+
+def adjust_calories_based_on_progress(base_calories, current_weight, target_weight, days_to_goal, session, username, current_date):
+    """
+    Adjust calorie targets based on actual weight progress vs target progression.
+    Only adjusts when more than 3 days out from target.
+    
+    Args:
+        base_calories: The baseline calorie calculation
+        current_weight: Current weight in lbs
+        target_weight: Target weight in lbs
+        days_to_goal: Days until target date
+        session: Database session to query weight logs
+        username: Username to look up weight history
+        current_date: Current date being viewed
+    
+    Returns:
+        Adjusted calorie target and adjustment info dict
+    """
+    # Only adjust if more than 3 days out
+    if days_to_goal <= 3:
+        return base_calories, {
+            'adjusted': False,
+            'reason': 'Within 3 days of target - using standard protocol'
+        }
+    
+    # Get most recent weight log
+    latest_weight_log = session.query(WeightLog).filter_by(
+        username=username
+    ).filter(
+        WeightLog.log_date <= current_date
+    ).order_by(WeightLog.log_date.desc()).first()
+    
+    if not latest_weight_log:
+        return base_calories, {
+            'adjusted': False,
+            'reason': 'No weight logged yet - log your weight to enable dynamic adjustments',
+            'needs_weight_log': True
+        }
+    
+    actual_weight = latest_weight_log.weight
+    
+    # Calculate where weight should be (5% above target when 3+ days out)
+    target_weight_at_this_stage = target_weight * 1.05
+    
+    # Calculate difference from target progression
+    weight_difference = actual_weight - target_weight_at_this_stage
+    
+    # Adjustment logic:
+    # If more than 1 lb above target progression: reduce calories by 200
+    # If more than 1 lb below target progression: increase calories by 200
+    adjustment = 0
+    adjustment_reason = ""
+    
+    if weight_difference > 1.0:
+        # Too heavy - reduce calories
+        adjustment = -200
+        adjustment_reason = f"Weight {weight_difference:.1f} lbs above target progression ({actual_weight:.1f} vs {target_weight_at_this_stage:.1f} lbs)"
+    elif weight_difference < -1.0:
+        # Too light - increase calories
+        adjustment = 200
+        adjustment_reason = f"Weight {abs(weight_difference):.1f} lbs below target progression ({actual_weight:.1f} vs {target_weight_at_this_stage:.1f} lbs)"
+    else:
+        adjustment_reason = f"Weight on track ({actual_weight:.1f} vs target {target_weight_at_this_stage:.1f} lbs)"
+    
+    adjusted_calories = base_calories + adjustment
+    
+    return adjusted_calories, {
+        'adjusted': adjustment != 0,
+        'adjustment': adjustment,
+        'reason': adjustment_reason,
+        'actual_weight': actual_weight,
+        'target_weight_at_stage': target_weight_at_this_stage,
+        'difference': weight_difference
+    }
+
+def calculate_bmr_and_calories(weight, height, bodyfat_percentage):
+    """
+    Calculate BMR and adjust for body composition.
+    Uses Katch-McArdle formula when body fat is provided, otherwise uses Mifflin-St Jeor.
+    
+    Args:
+        weight: Body weight in pounds
+        height: Height in inches
+        bodyfat_percentage: Body fat percentage (0-100)
+    
+    Returns:
+        BMR value
+    """
+    height_cm = height * 2.54
+    weight_kg = weight * 0.453592
+    
+    if bodyfat_percentage and bodyfat_percentage > 0:
+        # Katch-McArdle formula (more accurate when body composition is known)
+        # BMR = 370 + (21.6 × lean body mass in kg)
+        lean_body_mass_kg = weight_kg * (1 - bodyfat_percentage / 100)
+        bmr = 370 + (21.6 * lean_body_mass_kg)
+    else:
+        # Mifflin-St Jeor formula (assuming male, age 30)
+        bmr = (10 * weight_kg) + (6.25 * height_cm) - (5 * 30) + 5
+    
+    return bmr
 
 # Initialize session state
 if 'page' not in st.session_state:
@@ -316,19 +422,22 @@ def profile_page():
             min_value=0.0, 
             max_value=100.0,
             value=default_bodyfat,
-            step=0.1
+            step=0.1,
+            help="Used for more accurate calorie calculations via Katch-McArdle formula"
         )
     
     # Calculate and display macros dynamically (outside form)
     if weight > 0 and height > 0:
         st.subheader("📊 Your Macro Breakdown")
         
-        # Calculate BMR (using Mifflin-St Jeor equation)
-        height_cm = height * 2.54
-        weight_kg = weight * 0.453592
+        # Calculate BMR using body fat if provided
+        bmr = calculate_bmr_and_calories(weight, height, bodyfat_percentage)
         
-        # Assuming average age of 30 and male for calculation
-        bmr = (10 * weight_kg) + (6.25 * height_cm) - (5 * 30) + 5
+        # Calculate lean body mass for protein calculation
+        lean_body_mass = None
+        if bodyfat_percentage and bodyfat_percentage > 0:
+            lean_body_mass = weight * (1 - bodyfat_percentage / 100)
+            st.info(f"💪 **Lean Body Mass:** {lean_body_mass:.1f} lbs → **Protein Target:** {lean_body_mass * 1.2:.1f}g (1.2g per lb LBM)")
         
         # Calculate deficit/surplus based on goal
         days_to_goal = (target_date - today_date).days
@@ -336,20 +445,51 @@ def profile_page():
 
         # Determine activity level and macro split based on days to goal
         if days_to_goal == 3:  # Very active - training day
-            target_calories = bmr * 1.725
-            macros = calculate_macros(weight, target_calories, fat_percentage=0.25)
+            base_calories = bmr * 1.725
+            fat_pct = 0.25
         elif days_to_goal == 2:  # Moderately active
-            target_calories = bmr * 1.55
-            macros = calculate_macros(weight, target_calories, fat_percentage=0.35)
+            base_calories = bmr * 1.55
+            fat_pct = 0.35
         elif days_to_goal == 1:  # Lightly active - rest day
-            target_calories = bmr * 1.375
-            macros = calculate_macros(weight, target_calories, fat_percentage=0.45)
+            base_calories = bmr * 1.375
+            fat_pct = 0.45
         else:  # Default to moderate activity
-            target_calories = bmr * 1.725
-            macros = calculate_macros(weight, target_calories, fat_percentage=0.25)
+            base_calories = bmr * 1.725
+            fat_pct = 0.25
+        
+        # Adjust calories based on actual progress (only when >3 days out)
+        session_temp = Session()
+        target_calories, adjustment_info = adjust_calories_based_on_progress(
+            base_calories, weight, target_weight, days_to_goal, 
+            session_temp, st.session_state.logged_in_user, today_date
+        )
+        session_temp.close()
+        
+        # Calculate macros with adjusted calories
+        macros = calculate_macros(weight, target_calories, fat_percentage=fat_pct, lean_body_mass=lean_body_mass)
         
         # Calculate micros
         micros = calculate_micros(days_to_goal)
+        
+        # Display BMR and formula used
+        if bodyfat_percentage and bodyfat_percentage > 0:
+            st.success(f"🔬 **BMR:** {int(bmr)} cal/day (Katch-McArdle formula - body composition adjusted)")
+        else:
+            st.info(f"🔬 **BMR:** {int(bmr)} cal/day (Mifflin-St Jeor formula - add body fat % for more accuracy)")
+        
+        # Show calorie adjustment info if applicable
+        if adjustment_info.get('needs_weight_log'):
+            st.info(f"ℹ️ **Dynamic Adjustments:** {adjustment_info['reason']}\n\nGo to Food Log → Log your weight to enable automatic calorie adjustments based on your progress!")
+        elif adjustment_info['adjusted']:
+            if adjustment_info['adjustment'] > 0:
+                st.success(f"📈 **Calorie Adjustment:** +{adjustment_info['adjustment']} cal - {adjustment_info['reason']}")
+            else:
+                st.warning(f"📉 **Calorie Adjustment:** {adjustment_info['adjustment']} cal - {adjustment_info['reason']}")
+        else:
+            if days_to_goal > 3:
+                st.info(f"✅ **Weight Progress:** {adjustment_info['reason']}")
+            else:
+                st.info(f"🎯 **Final Days Protocol:** {adjustment_info['reason']}")
         
         # Display macros
         col1, col2, col3, col4 = st.columns(4)
@@ -380,7 +520,7 @@ def profile_page():
                 f"{weight} lbs",
                 f"{target_weight} lbs",
                 f"{height} inches",
-                f"{bodyfat_percentage}%",
+                f"{bodyfat_percentage}%" if bodyfat_percentage > 0 else "Not provided",
                 target_date.strftime('%Y-%m-%d'),
                 f"{days_to_goal} days"
             ]
@@ -622,24 +762,38 @@ def food_log_page():
     
     st.divider()
     
-    # Calculate targets
-    height_cm = profile.height * 2.54
-    weight_kg = profile.weight * 0.453592
-    bmr = (10 * weight_kg) + (6.25 * height_cm) - (5 * 30) + 5
+    # Calculate targets using body composition
+    bmr = calculate_bmr_and_calories(profile.weight, profile.height, profile.bodyfat_percentage)
+    
+    # Calculate lean body mass for protein
+    lean_body_mass = None
+    if profile.bodyfat_percentage and profile.bodyfat_percentage > 0:
+        lean_body_mass = profile.weight * (1 - profile.bodyfat_percentage / 100)
+    
     days_to_goal = (profile.target_date - st.session_state.current_date).days
     
+    # Determine base calories and fat percentage
     if days_to_goal == 3:
-        target_calories = bmr * 1.725
-        macros = calculate_macros(profile.weight, target_calories, fat_percentage=0.25)
+        base_calories = bmr * 1.725
+        fat_pct = 0.25
     elif days_to_goal == 2:
-        target_calories = bmr * 1.55
-        macros = calculate_macros(profile.weight, target_calories, fat_percentage=0.35)
+        base_calories = bmr * 1.55
+        fat_pct = 0.35
     elif days_to_goal == 1:
-        target_calories = bmr * 1.375
-        macros = calculate_macros(profile.weight, target_calories, fat_percentage=0.45)
+        base_calories = bmr * 1.375
+        fat_pct = 0.45
     else:
-        target_calories = bmr * 1.725
-        macros = calculate_macros(profile.weight, target_calories, fat_percentage=0.25)
+        base_calories = bmr * 1.725
+        fat_pct = 0.25
+    
+    # Adjust calories based on actual progress (only when >3 days out)
+    target_calories, adjustment_info = adjust_calories_based_on_progress(
+        base_calories, profile.weight, profile.target_weight, days_to_goal,
+        session, st.session_state.logged_in_user, st.session_state.current_date
+    )
+    
+    # Calculate macros with adjusted calories
+    macros = calculate_macros(profile.weight, target_calories, fat_percentage=fat_pct, lean_body_mass=lean_body_mass)
     
     micros = calculate_micros(days_to_goal)
     
@@ -678,6 +832,17 @@ def food_log_page():
         st.subheader("📊 Today's Progress")
     else:
         st.subheader(f"📊 Progress for {st.session_state.current_date.strftime('%B %d, %Y')}")
+    
+    # Show calorie adjustment info if applicable
+    if adjustment_info.get('needs_weight_log'):
+        st.warning(f"⚠️ **Dynamic Adjustments Disabled:** {adjustment_info['reason']}\n\nLog your weight above to see automatic calorie adjustments!")
+    elif adjustment_info['adjusted']:
+        if adjustment_info['adjustment'] > 0:
+            st.success(f"📈 **Calorie Adjustment:** +{adjustment_info['adjustment']} cal/day - {adjustment_info['reason']}")
+        else:
+            st.warning(f"📉 **Calorie Adjustment:** {adjustment_info['adjustment']} cal/day - {adjustment_info['reason']}")
+    elif days_to_goal > 3:
+        st.info(f"✅ {adjustment_info['reason']}")
     
     col1, col2, col3, col4 = st.columns(4)
     with col1:
