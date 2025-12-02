@@ -49,8 +49,22 @@ class WeightLog(Base):
     weight = Column(Float, nullable=False)
     notes = Column(String, default="")
 
+# Get database URL - supports both PostgreSQL (production) and SQLite (local dev)
+def get_database_url():
+    """Get database URL from Streamlit secrets or use local SQLite"""
+    try:
+        if 'DATABASE_URL' in st.secrets:
+            # Production: Use PostgreSQL from Streamlit secrets
+            return st.secrets['DATABASE_URL']
+    except:
+        pass
+    
+    # Local development: Use SQLite
+    return 'sqlite:///weight_tracker.db'
+
 # Create database engine for user data
-engine = create_engine('sqlite:///weight_tracker.db')
+DATABASE_URL = get_database_url()
+engine = create_engine(DATABASE_URL)
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 
@@ -332,19 +346,37 @@ def hash_password(password):
 def verify_password(password, hashed_password):
     """
     Verify a password against a hashed password.
+    Also handles legacy plain-text passwords for backward compatibility.
     
     Args:
         password: Plain text password string to verify
-        hashed_password: Stored hashed password (bytes or string)
+        hashed_password: Stored hashed password (bytes or string) or plain-text (legacy)
     
     Returns:
         True if password matches, False otherwise
     """
     # Handle both bytes and string formats
     if isinstance(hashed_password, str):
-        hashed_password = hashed_password.encode('utf-8')
+        # Check if it's a bcrypt hash (starts with $2b$ or $2a$)
+        if hashed_password.startswith('$2b$') or hashed_password.startswith('$2a$'):
+            hashed_password = hashed_password.encode('utf-8')
+        else:
+            # Legacy plain-text password - direct comparison
+            return password == hashed_password
     
-    return bcrypt.checkpw(password.encode('utf-8'), hashed_password)
+    # Check if bytes is a bcrypt hash
+    if isinstance(hashed_password, bytes):
+        if hashed_password.startswith(b'$2b$') or hashed_password.startswith(b'$2a$'):
+            try:
+                return bcrypt.checkpw(password.encode('utf-8'), hashed_password)
+            except ValueError:
+                # Invalid hash format
+                return False
+        else:
+            # Legacy plain-text password stored as bytes
+            return password == hashed_password.decode('utf-8')
+    
+    return False
 
 # Initialize session state
 if 'page' not in st.session_state:
@@ -381,8 +413,22 @@ def login_page():
             user = session.query(User).filter_by(username=username).first()
             
             if user:
-                # Verify password using bcrypt
+                # Verify password using bcrypt or plain-text (legacy)
                 if verify_password(password, user.password):
+                    # Check if password needs to be migrated (is plain-text)
+                    needs_migration = False
+                    if isinstance(user.password, str):
+                        if not (user.password.startswith('$2b$') or user.password.startswith('$2a$')):
+                            needs_migration = True
+                    elif isinstance(user.password, bytes):
+                        if not (user.password.startswith(b'$2b$') or user.password.startswith(b'$2a$')):
+                            needs_migration = True
+                    
+                    # Migrate password to hashed version on successful login
+                    if needs_migration:
+                        user.password = hash_password(password)
+                        session.commit()
+                    
                     st.session_state.logged_in_user = username
                     st.session_state.page = 'profile'
                     session.close()
