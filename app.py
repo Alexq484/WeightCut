@@ -5,7 +5,6 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime, timedelta
 import sqlite3
-import bcrypt
 
 # Database setup
 Base = declarative_base()
@@ -331,53 +330,6 @@ def calculate_bmr_and_calories(weight, height, bodyfat_percentage):
     
     return bmr
 
-def hash_password(password):
-    """
-    Hash a password using bcrypt.
-    
-    Args:
-        password: Plain text password string
-    
-    Returns:
-        Hashed password as bytes
-    """
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
-
-def verify_password(password, hashed_password):
-    """
-    Verify a password against a hashed password.
-    Also handles legacy plain-text passwords for backward compatibility.
-    
-    Args:
-        password: Plain text password string to verify
-        hashed_password: Stored hashed password (bytes or string) or plain-text (legacy)
-    
-    Returns:
-        True if password matches, False otherwise
-    """
-    # Handle both bytes and string formats
-    if isinstance(hashed_password, str):
-        # Check if it's a bcrypt hash (starts with $2b$ or $2a$)
-        if hashed_password.startswith('$2b$') or hashed_password.startswith('$2a$'):
-            hashed_password = hashed_password.encode('utf-8')
-        else:
-            # Legacy plain-text password - direct comparison
-            return password == hashed_password
-    
-    # Check if bytes is a bcrypt hash
-    if isinstance(hashed_password, bytes):
-        if hashed_password.startswith(b'$2b$') or hashed_password.startswith(b'$2a$'):
-            try:
-                return bcrypt.checkpw(password.encode('utf-8'), hashed_password)
-            except ValueError:
-                # Invalid hash format
-                return False
-        else:
-            # Legacy plain-text password stored as bytes
-            return password == hashed_password.decode('utf-8')
-    
-    return False
-
 # Initialize session state
 if 'page' not in st.session_state:
     st.session_state.page = 'login'
@@ -410,35 +362,15 @@ def login_page():
         
         if login_button:
             session = Session()
-            user = session.query(User).filter_by(username=username).first()
+            user = session.query(User).filter_by(username=username, password=password).first()
+            session.close()
             
             if user:
-                # Verify password using bcrypt or plain-text (legacy)
-                if verify_password(password, user.password):
-                    # Check if password needs to be migrated (is plain-text)
-                    needs_migration = False
-                    if isinstance(user.password, str):
-                        if not (user.password.startswith('$2b$') or user.password.startswith('$2a$')):
-                            needs_migration = True
-                    elif isinstance(user.password, bytes):
-                        if not (user.password.startswith(b'$2b$') or user.password.startswith(b'$2a$')):
-                            needs_migration = True
-                    
-                    # Migrate password to hashed version on successful login
-                    if needs_migration:
-                        user.password = hash_password(password)
-                        session.commit()
-                    
-                    st.session_state.logged_in_user = username
-                    st.session_state.page = 'profile'
-                    session.close()
-                    st.rerun()
-                else:
-                    st.error("Invalid username or password")
-                    session.close()
+                st.session_state.logged_in_user = username
+                st.session_state.page = 'profile'
+                st.rerun()
             else:
                 st.error("Invalid username or password")
-                session.close()
         
         if signup_button:
             if username and password:
@@ -448,9 +380,7 @@ def login_page():
                 if existing_user:
                     st.error("Username already exists")
                 else:
-                    # Hash the password before storing
-                    hashed_password = hash_password(password)
-                    new_user = User(username=username, password=hashed_password)
+                    new_user = User(username=username, password=password)
                     session.add(new_user)
                     session.commit()
                     st.success("Account created! Please login.")
